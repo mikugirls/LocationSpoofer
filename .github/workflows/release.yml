@@ -6,10 +6,25 @@ on:
       - main
       - master
     paths:
-      - 'app/build.gradle.kts' # 只有当这个文件变动时才会检查并触发
+      - 'app/build.gradle.kts'
+  # 新增：支持手动触发，可输入密钥信息（都有默认值）
+  workflow_dispatch:
+    inputs:
+      keystore_password:
+        description: '密钥库密码'
+        required: false
+        default: 'key10086'
+      key_alias:
+        description: '密钥别名'
+        required: false
+        default: 'key10086'
+      key_password:
+        description: '密钥密码'
+        required: false
+        default: 'key10086'
 
 permissions:
-  contents: write # 允许 GITHUB_TOKEN 创建 Release 和 Tag
+  contents: write
 
 jobs:
   build-and-release:
@@ -18,12 +33,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 需要完整的提交历史来获取 tag 和并生成 changelog
+          fetch-depth: 0
 
       - name: Check if Version Changed
         id: check_version
         run: |
-          # 提取 app/build.gradle.kts 中的 versionName
           VERSION_NAME=$(grep 'versionName =' app/build.gradle.kts | head -n 1 | awk -F'"' '{print $2}')
           echo "当前代码中的 versionName: $VERSION_NAME"
           
@@ -34,9 +48,8 @@ jobs:
           
           TAG_NAME="v$VERSION_NAME"
           
-          # 检查对应的 tag 是否已经存在
           if git ls-remote --tags origin | grep -q "refs/tags/$TAG_NAME"; then
-            echo "Tag $TAG_NAME 已经存在，说明版本没有更新或已发版，跳过后续操作。"
+            echo "Tag $TAG_NAME 已经存在，跳过后续操作。"
             echo "changed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -49,51 +62,64 @@ jobs:
         if: steps.check_version.outputs.changed == 'true'
         id: changelog
         run: |
-          # 获取上一个 tag 的名字
           PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           
-          # 指定输出格式为纯文本，并且过滤掉 Merge Commit
           if [ -z "$PREV_TAG" ]; then
-            echo "没有找到上一个 tag，获取所有提交记录。"
             LOGS=$(git log --no-merges --pretty=format:"- %s")
           else
-            echo "上一个 tag: $PREV_TAG"
             LOGS=$(git log $PREV_TAG..HEAD --no-merges --pretty=format:"- %s")
           fi
           
-          # 将日志写入文件（解决多行输出的问题），作为 Release 的正文
           echo "$LOGS" > changelog.txt
           cat changelog.txt
-          
+
       - name: Setup Java
         if: steps.check_version.outputs.changed == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17' # Gradle 需要 Java 17 进行编译
+          java-version: '17'
           cache: 'gradle'
 
-      - name: Decode Keystore
+      # ---------- 密钥生成（优先使用手动输入，否则用默认 key10086）----------
+      - name: Generate Keystore
         if: steps.check_version.outputs.changed == 'true'
-        env:
-          ENCODED_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          echo $ENCODED_KEYSTORE | base64 -d > $RUNNER_TEMP/keystore.jks
+          # 若为 workflow_dispatch 触发则取输入，否则都用默认值 key10086
+          STORE_PASS="${{ github.event.inputs.keystore_password || 'key10086' }}"
+          KEY_ALIAS="${{ github.event.inputs.key_alias || 'key10086' }}"
+          KEY_PASS="${{ github.event.inputs.key_password || 'key10086' }}"
+          
+          # 固定组织信息（可改）
+          DNAME="CN=CI Build, OU=Auto, O=GitHubActions, L=Nowhere, S=Nowhere, C=XX"
+          
+          keytool -genkey -v \
+            -keystore $RUNNER_TEMP/keystore.jks \
+            -storetype JKS \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias "$KEY_ALIAS" \
+            -storepass "$STORE_PASS" \
+            -keypass "$KEY_PASS" \
+            -dname "$DNAME"
+          
+          # 传递给后续步骤
+          echo "KEYSTORE_FILE_PATH=$RUNNER_TEMP/keystore.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$STORE_PASS" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$KEY_PASS" >> $GITHUB_ENV
 
       - name: Build Release APK
         if: steps.check_version.outputs.changed == 'true'
         env:
-          KEYSTORE_FILE_PATH: ${{ runner.temp }}/keystore.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEYSTORE_FILE_PATH: ${{ env.KEYSTORE_FILE_PATH }}
+          KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ env.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD }}
         run: |
           chmod +x ./gradlew
           ./gradlew --no-daemon :app:assembleRelease
 
-          # 重命名打包好的 APK，准备发布
           APK_DIR="app/build/outputs/apk/release"
-          # 寻找构建出来的 apk 并重命名
           find $APK_DIR -name "*.apk" -print0 | while IFS= read -r -d '' file; do
             mv "$file" "$APK_DIR/LocationSpoofer-${{ steps.check_version.outputs.tag }}.apk"
           done
